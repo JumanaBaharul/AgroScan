@@ -245,4 +245,4 @@ This project is for academic and research purposes.
 
 ## Author
 
-**Jumana Baharul** — [deepikajumana@gmail.com](mailto:deepikajumana@gmail.com)
+**Jumana Baharul** 
