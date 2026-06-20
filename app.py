@@ -1,25 +1,24 @@
-'''
 from pathlib import Path
+import time
 
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from tensorflow.keras.models import load_model
-import io
-import csv
 
 from simulate import simulate_sequence
-from optimized_path import compare_algorithms
+from optimized_path import (
+    run_astar, run_mst, run_tsp, run_dijkstra, run_sa,
+    path_distance, disease_gain, count_turns,
+)
 
 
-# ══════════════════════════════════════════════
-# 3-CLASS LABEL MAPPING  (matches training)
-# ══════════════════════════════════════════════
-DISEASE_LABELS = {
-    0: "Pest Attack",
-    1: "Overwatering",
-    2: "Water Stress"
-}
+# ══════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════════════
+DISEASE_LABELS = {0: "Pest Attack", 1: "Overwatering", 2: "Water Stress"}
 
 DISEASE_COLORS = {
     "Pest Attack":  "#ef4444",
@@ -27,296 +26,10 @@ DISEASE_COLORS = {
     "Water Stress": "#eab308",
 }
 
-DISCRETE_SCALE = [
-    [0.00, "#ef4444"], [0.33, "#ef4444"],
-    [0.33, "#3b82f6"], [0.67, "#3b82f6"],
-    [0.67, "#eab308"], [1.00, "#eab308"],
-]
-
-
-# ══════════════════════════════════════════════
-# CACHED MODEL LOAD
-# ══════════════════════════════════════════════
-@st.cache_resource
-def _cached_model():
-    root = Path(__file__).resolve().parent
-    model_path = root / "crop_disease_convlstm.keras"
-    if not model_path.is_file():
-        raise FileNotFoundError(f"Model not found: {model_path}")
-    return load_model(str(model_path))
-
-
-# ══════════════════════════════════════════════
-# FARM ANALYSIS
-# ══════════════════════════════════════════════
-def run_farm_analysis(model, spray_percentile=90, seed=42):
-    np.random.seed(seed)
-
-    T, C = 12, 9
-    PLOT_H, PLOT_W = 64, 64
-    GRID_Y, GRID_X = 4, 4
-    FARM_H = GRID_Y * PLOT_H
-    FARM_W = GRID_X * PLOT_W
-
-    farm_prob = np.zeros((FARM_H, FARM_W))
-    farm_gt = np.zeros((FARM_H, FARM_W))
-    plot_disease_id = np.zeros((GRID_Y, GRID_X), dtype=int)
-    plot_confidence = np.zeros((GRID_Y, GRID_X))
-    plot_simulated = np.empty((GRID_Y, GRID_X), dtype=object)
-
-    for gy in range(GRID_Y):
-        for gx in range(GRID_X):
-            disease = np.random.choice(["pest", "overwater", "water_stress"])
-            base = np.random.rand(T, PLOT_H, PLOT_W, C)
-
-            seq, gt_masks = simulate_sequence(
-                base,
-                disease=disease,
-                max_severity=np.random.uniform(0.3, 0.6)
-            )
-
-            noise = np.random.normal(0, 0.02, seq.shape)
-            seq = np.clip(seq + noise, 0, 1)
-
-            cls, msk = model.predict(np.expand_dims(seq, 0), verbose=0)
-
-            disease_id = int(np.argmax(cls))
-            confidence = float(np.max(cls))
-            prob_mask = msk[0, ..., 0]
-
-            y0, y1 = gy * PLOT_H, (gy+1) * PLOT_H
-            x0, x1 = gx * PLOT_W, (gx+1) * PLOT_W
-
-            farm_prob[y0:y1, x0:x1] = prob_mask
-            farm_gt[y0:y1, x0:x1] = gt_masks[-1]
-            plot_disease_id[gy, gx] = disease_id
-            plot_confidence[gy, gx] = confidence
-            plot_simulated[gy, gx] = disease
-
-    norm = (farm_prob - farm_prob.min()) / (farm_prob.max() - farm_prob.min() + 1e-6)
-    threshold = np.percentile(norm, spray_percentile)
-    farm_spray = norm > threshold
-
-    df, paths = compare_algorithms(farm_prob, farm_spray)
-    best_algo = df.iloc[0]["Algorithm"]
-    path = paths[best_algo]
-
-    return {
-        "farm_prob": farm_prob,
-        "farm_spray": farm_spray,
-        "path": path,
-        "best_algo": best_algo,
-        "grid_y": GRID_Y,
-        "grid_x": GRID_X,
-        "plot_disease_id": plot_disease_id,
-        "plot_confidence": plot_confidence,
-        "plot_simulated": plot_simulated,
-    }
-
-
-# ══════════════════════════════════════════════
-# PLOTLY HELPERS
-# ══════════════════════════════════════════════
-def fig_route_map(farm_prob, farm_spray, path, show_spray):
-    fig = go.Figure()
-    fig.add_trace(go.Heatmap(z=farm_prob, colorscale="Reds"))
-
-    if show_spray and farm_spray.any():
-        fig.add_trace(go.Heatmap(
-            z=farm_spray.astype(np.float64),
-            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,191,255,0.35)"]],
-            showscale=False,
-        ))
-
-    if path:
-        xs = [p[1] + 0.5 for p in path]
-        ys = [p[0] + 0.5 for p in path]
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color="cyan")))
-        fig.add_trace(go.Scatter(
-            x=[xs[0]], y=[ys[0]],
-            mode="markers",
-            marker=dict(size=12, color="yellow", symbol="star")
-        ))
-
-    fig.update_layout(title="Farm Disease Map + Treatment Route", height=420)
-    return fig
-
-
-def fig_stress_grid(plot_disease_id, grid_y, grid_x):
-    z = plot_disease_id.astype(float)
-    text = [
-        [DISEASE_LABELS[plot_disease_id[r, c]] for c in range(grid_x)]
-        for r in range(grid_y)
-    ]
-    fig = go.Figure(data=go.Heatmap(
-        z=z, text=text,
-        texttemplate="%{text}",
-        colorscale=DISCRETE_SCALE,
-        showscale=False,
-        zmin=0, zmax=2
-    ))
-    fig.update_layout(title="Predicted Stress per Plot", height=300)
-    return fig
-
-
-# ══════════════════════════════════════════════
-# MAIN STREAMLIT APP
-# ══════════════════════════════════════════════
-def main():
-    st.set_page_config(page_title="AgroScan", layout="wide", page_icon="🌾")
-
-    # Header
-    st.markdown("""
-        <h1 style='font-family:Georgia,serif; color:#166534;'>
-            🌾 AgroScan Farm Dashboard
-        </h1>
-        <p style='color:#6b7280; margin-top:-10px;'>
-            Precision Agriculture · Disease Localization · Optimized Treatment
-        </p>
-        <hr style='border-color:#d1fae5;'>
-    """, unsafe_allow_html=True)
-
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Controls")
-        seed = st.number_input("Random seed", min_value=0, value=42, step=1)
-        spray_pct = st.slider("Spray zone percentile", 80, 98, 90)
-        show_spray = st.checkbox("Highlight spray zones", True)
-        show_sim = st.checkbox("Show simulated disease", True)
-        run = st.button("▶ Run / Refresh Farm", use_container_width=True)
-
-        st.markdown("---")
-        st.caption("Disease key")
-        for label, color in DISEASE_COLORS.items():
-            st.markdown(
-                f"<span style='color:{color}; font-size:18px;'>■</span> {label}",
-                unsafe_allow_html=True
-            )
-
-    if "result" not in st.session_state:
-        st.session_state.result = None
-
-    if run:
-        with st.spinner("Running farm analysis (this may take ~60 s)…"):
-            model = _cached_model()
-            result = run_farm_analysis(model, spray_pct, seed)
-            st.session_state.result = result
-        st.success("Analysis complete!")
-
-    result = st.session_state.result
-    if result is None:
-        st.stop()
-
-    farm_prob = result["farm_prob"]
-    farm_spray = result["farm_spray"]
-    path = result["path"]
-    best_algo = result["best_algo"]
-    gy, gx = result["grid_y"], result["grid_x"]
-    pid = result["plot_disease_id"]
-    conf = result["plot_confidence"]
-    sim = result["plot_simulated"]
-
-    # KPI + CSV
-    k1, k2, k3, k4, k5 = st.columns([1,1,1,1,1])
-
-    k1.metric("Total Plots", gy * gx)
-    k2.metric("Spray Coverage", f"{100*farm_spray.mean():.1f}%")
-    k3.metric("Treatment Steps", len(path))
-    k4.metric("Best Algorithm", best_algo)
-
-    with k5:
-        st.markdown("### ⬇ CSV")
-        if path:
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-            writer.writerow(["step", "row", "col"])
-            for i, (y, x) in enumerate(path):
-                writer.writerow([i, y, x])
-
-            st.download_button(
-                "Download",
-                buf.getvalue().encode("utf-8"),
-                "treatment_path.csv",
-                "text/csv",
-                use_container_width=True
-            )
-        else:
-            st.caption("No path")
-
-    st.markdown("---")
-
-    # Charts
-    col_map, col_grid = st.columns([3, 1])
-
-    with col_map:
-        st.plotly_chart(fig_route_map(farm_prob, farm_spray, path, show_spray), use_container_width=True)
-
-    with col_grid:
-        st.plotly_chart(fig_stress_grid(pid, gy, gx), use_container_width=True)
-
-    st.markdown("---")
-
-    # Table
-    st.subheader("📋 Plot-by-Plot Report")
-
-    rows = []
-    for r in range(gy):
-        for c in range(gx):
-            row = {
-                "Row": r,
-                "Col": c,
-                "Predicted Stress": DISEASE_LABELS[pid[r, c]],
-                "Confidence %": round(float(conf[r, c]) * 100, 1),
-            }
-            if show_sim:
-                row["Simulated Disease"] = str(sim[r, c])
-                row["Match ✓/✗"] = (
-                    "✓" if (
-                        (sim[r, c] == "pest" and pid[r, c] == 0) or
-                        (sim[r, c] == "overwater" and pid[r, c] == 1) or
-                        (sim[r, c] == "water_stress" and pid[r, c] == 2)
-                    ) else "✗"
-                )
-            rows.append(row)
-
-    st.dataframe(rows, use_container_width=True)
-
-    # Distribution
-    st.subheader("📊 Disease Distribution")
-    counts = {DISEASE_LABELS[k]: int(np.sum(pid == k)) for k in DISEASE_LABELS}
-    col_a, col_b, col_c = st.columns(3)
-    for col, (name, count) in zip([col_a, col_b, col_c], counts.items()):
-        col.metric(name, count, f"{100*count/(gy*gx):.0f}% of plots")
-
-
-if __name__ == "__main__":
-    main()
-'''
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-from tensorflow.keras.models import load_model
-
-from simulate import simulate_sequence
-from optimized_path import compare_algorithms
-
-
-# ══════════════════════════════════════════════
-# 3-CLASS LABEL MAPPING  (matches training)
-# ══════════════════════════════════════════════
-DISEASE_LABELS = {
-    0: "Pest Attack",
-    1: "Overwatering",
-    2: "Water Stress"
-}
-
-DISEASE_COLORS = {
-    "Pest Attack":  "#ef4444",   # red
-    "Overwatering": "#3b82f6",   # blue
-    "Water Stress": "#eab308",   # yellow
+DISEASE_ICONS = {
+    "Pest Attack":  "🐛",
+    "Overwatering": "💧",
+    "Water Stress": "🌵",
 }
 
 DISCRETE_SCALE = [
@@ -325,43 +38,38 @@ DISCRETE_SCALE = [
     [0.67, "#eab308"], [1.00, "#eab308"],
 ]
 
-# ══════════════════════════════════════════════
-# GPS BOUNDING BOX  (Thanjavur farmland, Tamil Nadu)
-# Covers the 256×256 pixel farm grid
-# ══════════════════════════════════════════════
-LAT_MAX = 10.7564   # top    (row = 0)
-LAT_MIN = 10.7500   # bottom (row = FARM_H)
-LON_MIN = 79.1300   # left   (col = 0)
-LON_MAX = 79.1364   # right  (col = FARM_W)
+ALGO_COLORS = {
+    "Direct A*":           "#06b6d4",
+    "MST + A*":            "#8b5cf6",
+    "TSP":                 "#f97316",
+    "Dijkstra":            "#10b981",
+    "Simulated Annealing": "#f43f5e",
+}
+
+LAT_MAX, LAT_MIN = 10.7564, 10.7500
+LON_MIN, LON_MAX = 79.1300, 79.1364
 
 PLOT_H, PLOT_W = 64, 64
 GRID_Y, GRID_X = 4, 4
-FARM_H         = GRID_Y * PLOT_H   # 256
-FARM_W         = GRID_X * PLOT_W   # 256
+FARM_H = GRID_Y * PLOT_H   # 256
+FARM_W = GRID_X * PLOT_W   # 256
 
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # GPS HELPERS
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 def pixel_to_gps(row, col):
-    """Convert pixel (row, col) → (latitude, longitude)."""
     lat = LAT_MAX - (row / FARM_H) * (LAT_MAX - LAT_MIN)
     lon = LON_MIN + (col / FARM_W) * (LON_MAX - LON_MIN)
     return round(lat, 6), round(lon, 6)
 
 
 def build_waypoints_df(path, farm_prob, farm_spray, plot_disease_id):
-    """
-    Build a DataFrame of SPRAY-ONLY waypoints with GPS coordinates.
-
-    Columns: Step, Pixel_Row, Pixel_Col, Latitude, Longitude,
-             Severity, Spray, Disease_Type
-    """
     rows = []
     step = 1
     for r, c in path:
         if not farm_spray[r, c]:
-            continue                          # skip non-spray points
+            continue
         lat, lon = pixel_to_gps(r, c)
         gy = min(r // PLOT_H, GRID_Y - 1)
         gx = min(c // PLOT_W, GRID_X - 1)
@@ -379,24 +87,54 @@ def build_waypoints_df(path, farm_prob, farm_spray, plot_disease_id):
     return pd.DataFrame(rows)
 
 
-# ══════════════════════════════════════════════
-# CACHED MODEL LOAD
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# MODEL
+# ══════════════════════════════════════════════════════════════════
 @st.cache_resource
 def _cached_model():
-    root       = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent
     model_path = root / "crop_disease_convlstm.keras"
     if not model_path.is_file():
         raise FileNotFoundError(f"Model not found: {model_path}")
     return load_model(str(model_path))
 
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# ALGORITHM COMPARISON  (no plt.show — safe for Streamlit)
+# ══════════════════════════════════════════════════════════════════
+def _compare_algorithms(prob_map, spray_mask, start=(0, 0)):
+    algos = {
+        "Direct A*":           run_astar,
+        "MST + A*":            run_mst,
+        "TSP":                 run_tsp,
+        "Dijkstra":            run_dijkstra,
+        "Simulated Annealing": run_sa,
+    }
+    results, paths = [], {}
+    for name, func in algos.items():
+        t0   = time.time()
+        path = func(prob_map, spray_mask, start)
+        rt   = time.time() - t0
+        dist = path_distance(path)
+        gain = disease_gain(path, prob_map)
+        results.append({
+            "Algorithm":   name,
+            "Distance":    round(dist, 2),
+            "Gain":        round(gain, 2),
+            "Efficiency":  round(gain / (dist + 1e-6), 4),
+            "Turns":       count_turns(path),
+            "Runtime (s)": round(rt, 4),
+        })
+        paths[name] = path
+    df = pd.DataFrame(results).sort_values("Efficiency", ascending=False)
+    return df, paths
+
+
+# ══════════════════════════════════════════════════════════════════
 # FARM ANALYSIS
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 def run_farm_analysis(model, spray_percentile=90, seed=42):
     np.random.seed(seed)
-
     T, C = 12, 9
 
     farm_prob       = np.zeros((FARM_H, FARM_W))
@@ -411,269 +149,658 @@ def run_farm_analysis(model, spray_percentile=90, seed=42):
             base    = np.random.rand(T, PLOT_H, PLOT_W, C)
 
             seq, gt_masks = simulate_sequence(
-                base,
-                disease=disease,
+                base, disease=disease,
                 max_severity=np.random.uniform(0.3, 0.6)
             )
-
             noise = np.random.normal(0, 0.02, seq.shape)
             seq   = np.clip(seq + noise, 0, 1)
 
             cls, msk   = model.predict(np.expand_dims(seq, 0), verbose=0)
             disease_id = int(np.argmax(cls))
             confidence = float(np.max(cls))
-
-            print("Prediction:", cls)
-
-            prob_mask = msk[0, ..., 0]
+            prob_mask  = msk[0, ..., 0]
 
             y0, y1 = gy * PLOT_H, (gy + 1) * PLOT_H
             x0, x1 = gx * PLOT_W, (gx + 1) * PLOT_W
-
             farm_prob[y0:y1, x0:x1] = prob_mask
             farm_gt[y0:y1, x0:x1]   = gt_masks[-1]
             plot_disease_id[gy, gx] = disease_id
             plot_confidence[gy, gx] = confidence
             plot_simulated[gy, gx]  = disease
 
-    # Spray zone
     norm       = (farm_prob - farm_prob.min()) / (farm_prob.max() - farm_prob.min() + 1e-6)
     threshold  = np.percentile(norm, spray_percentile)
     farm_spray = norm > threshold
 
-    # Best path
-    df_algo, paths = compare_algorithms(farm_prob, farm_spray)
-    best_algo      = df_algo.iloc[0]["Algorithm"]
-    path           = paths[best_algo]
+    df_algo, all_paths = _compare_algorithms(farm_prob, farm_spray)
+    best_algo  = df_algo.iloc[0]["Algorithm"]
+    best_path  = all_paths[best_algo]
 
-    # Spray-only waypoints with GPS
-    df_waypoints = build_waypoints_df(path, farm_prob, farm_spray, plot_disease_id)
+    df_waypoints = build_waypoints_df(best_path, farm_prob, farm_spray, plot_disease_id)
 
     return {
         "farm_prob":       farm_prob,
         "farm_spray":      farm_spray,
-        "path":            path,
+        "path":            best_path,
         "best_algo":       best_algo,
+        "df_algo":         df_algo,
+        "all_paths":       all_paths,
         "df_waypoints":    df_waypoints,
-        "grid_y":          GRID_Y,
-        "grid_x":          GRID_X,
         "plot_disease_id": plot_disease_id,
         "plot_confidence": plot_confidence,
         "plot_simulated":  plot_simulated,
     }
 
 
-# ══════════════════════════════════════════════
-# PLOTLY HELPERS
-# ══════════════════════════════════════════════
-def fig_route_map(farm_prob, farm_spray, path, show_spray):
+# ══════════════════════════════════════════════════════════════════
+# PLOTLY FIGURES
+# ══════════════════════════════════════════════════════════════════
+def fig_farm_map(farm_prob, farm_spray, path, show_spray):
     fig = go.Figure()
-    fig.add_trace(go.Heatmap(z=farm_prob, colorscale="Reds", name="Disease Prob"))
-
+    fig.add_trace(go.Heatmap(
+        z=farm_prob, colorscale="Reds",
+        colorbar=dict(title="Severity", thickness=12, len=0.8),
+        name="Disease Prob"
+    ))
     if show_spray and farm_spray.any():
         fig.add_trace(go.Heatmap(
-            z=farm_spray.astype(np.float64),
-            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,191,255,0.35)"]],
-            showscale=False,
-            name="Spray Zone"
+            z=farm_spray.astype(float),
+            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,191,255,0.4)"]],
+            showscale=False, name="Spray Zone"
         ))
-
     if path:
         xs = [p[1] + 0.5 for p in path]
         ys = [p[0] + 0.5 for p in path]
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines",
-            line=dict(color="cyan", width=2),
-            name="Treatment Path"
+            line=dict(color="cyan", width=2), name="Treatment Route"
         ))
         fig.add_trace(go.Scatter(
             x=[xs[0]], y=[ys[0]], mode="markers",
-            marker=dict(size=12, color="yellow", symbol="star"),
-            name="Start"
+            marker=dict(size=14, color="yellow", symbol="star"), name="Start"
+        ))
+        fig.add_trace(go.Scatter(
+            x=[xs[-1]], y=[ys[-1]], mode="markers",
+            marker=dict(size=11, color="lime", symbol="square"), name="End"
+        ))
+    for i in range(1, GRID_Y):
+        fig.add_hline(y=i * PLOT_H, line=dict(color="white", width=1, dash="dot"))
+    for i in range(1, GRID_X):
+        fig.add_vline(x=i * PLOT_W, line=dict(color="white", width=1, dash="dot"))
+    fig.update_layout(
+        title="Farm Disease Heatmap + Optimised Treatment Route",
+        height=440, margin=dict(l=0, r=0, t=40, b=0),
+        legend=dict(orientation="h", y=-0.12, font=dict(size=11)),
+    )
+    return fig
+
+
+def fig_stress_grid(plot_disease_id):
+    text = [
+        [DISEASE_LABELS[plot_disease_id[r, c]] for c in range(GRID_X)]
+        for r in range(GRID_Y)
+    ]
+    fig = go.Figure(go.Heatmap(
+        z=plot_disease_id.astype(float), text=text,
+        texttemplate="%{text}", colorscale=DISCRETE_SCALE,
+        showscale=False, zmin=0, zmax=2
+    ))
+    fig.update_layout(
+        title="Per-Plot Stress Classification",
+        height=300, margin=dict(l=0, r=0, t=40, b=0)
+    )
+    return fig
+
+
+def fig_gps_map(df_waypoints, path, plot_disease_id):
+    fig = go.Figure()
+
+    # Farm boundary
+    fig.add_trace(go.Scattermapbox(
+        lat=[LAT_MIN, LAT_MAX, LAT_MAX, LAT_MIN, LAT_MIN],
+        lon=[LON_MIN, LON_MIN, LON_MAX, LON_MAX, LON_MIN],
+        mode="lines", line=dict(color="white", width=2),
+        name="Farm Boundary", hoverinfo="skip"
+    ))
+
+    # 4×4 grid lines
+    for i in range(1, GRID_Y):
+        lat = LAT_MAX - i * (LAT_MAX - LAT_MIN) / GRID_Y
+        fig.add_trace(go.Scattermapbox(
+            lat=[lat, lat], lon=[LON_MIN, LON_MAX], mode="lines",
+            line=dict(color="rgba(255,255,255,0.35)", width=1),
+            showlegend=False, hoverinfo="skip"
+        ))
+    for i in range(1, GRID_X):
+        lon = LON_MIN + i * (LON_MAX - LON_MIN) / GRID_X
+        fig.add_trace(go.Scattermapbox(
+            lat=[LAT_MIN, LAT_MAX], lon=[lon, lon], mode="lines",
+            line=dict(color="rgba(255,255,255,0.35)", width=1),
+            showlegend=False, hoverinfo="skip"
+        ))
+
+    # Plot centre markers (one per 4×4 cell)
+    lats, lons, colors, texts = [], [], [], []
+    for gy in range(GRID_Y):
+        for gx in range(GRID_X):
+            cr = gy * PLOT_H + PLOT_H // 2
+            cc = gx * PLOT_W + PLOT_W // 2
+            lat, lon = pixel_to_gps(cr, cc)
+            label = DISEASE_LABELS[plot_disease_id[gy, gx]]
+            lats.append(lat)
+            lons.append(lon)
+            colors.append(DISEASE_COLORS[label])
+            texts.append(f"Plot ({gy},{gx}): {DISEASE_ICONS[label]} {label}")
+    fig.add_trace(go.Scattermapbox(
+        lat=lats, lon=lons, mode="markers",
+        marker=dict(size=16, color=colors, opacity=0.9),
+        text=texts, hoverinfo="text", name="Plot Centres"
+    ))
+
+    # Spray waypoints grouped by disease type
+    if not df_waypoints.empty:
+        for dtype in df_waypoints["Disease_Type"].unique():
+            sub = df_waypoints[df_waypoints["Disease_Type"] == dtype]
+            fig.add_trace(go.Scattermapbox(
+                lat=sub["Latitude"].tolist(),
+                lon=sub["Longitude"].tolist(),
+                mode="markers",
+                marker=dict(size=6, color=DISEASE_COLORS.get(dtype, "#94a3b8"), opacity=0.65),
+                name=f"Spray · {dtype}",
+                hovertemplate="Step %{customdata[0]}<br>Severity: %{customdata[1]:.3f}",
+                customdata=sub[["Step", "Severity"]].values,
+            ))
+
+    # Treatment route (sampled every 4th point for map performance)
+    if path:
+        route_lats, route_lons = [], []
+        for r, c in path[::4]:
+            lat, lon = pixel_to_gps(r, c)
+            route_lats.append(lat)
+            route_lons.append(lon)
+        fig.add_trace(go.Scattermapbox(
+            lat=route_lats, lon=route_lons, mode="lines",
+            line=dict(color="cyan", width=2), name="Treatment Route", opacity=0.85
+        ))
+        s_lat, s_lon = pixel_to_gps(path[0][0], path[0][1])
+        fig.add_trace(go.Scattermapbox(
+            lat=[s_lat], lon=[s_lon], mode="markers",
+            marker=dict(size=14, color="yellow"), name="Depot / Start"
         ))
 
     fig.update_layout(
-        title="Farm Disease Map + Treatment Route",
-        height=420,
-        margin=dict(l=0, r=0, t=40, b=0)
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=(LAT_MIN + LAT_MAX) / 2, lon=(LON_MIN + LON_MAX) / 2),
+            zoom=16
+        ),
+        height=520, margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.85)", bordercolor="#d1d5db",
+            borderwidth=1, font=dict(size=11)
+        )
     )
     return fig
 
 
-def fig_stress_grid(plot_disease_id, grid_y, grid_x):
-    z    = plot_disease_id.astype(float)
-    text = [
-        [DISEASE_LABELS[plot_disease_id[r, c]] for c in range(grid_x)]
-        for r in range(grid_y)
+def fig_algo_paths(farm_prob, all_paths, best_algo):
+    names = list(all_paths.keys())
+    fig = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=[
+            f"{'🏆 ' if n == best_algo else ''}{n}" for n in names
+        ] + [""],
+        vertical_spacing=0.1, horizontal_spacing=0.04
+    )
+    positions = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]
+    for idx, name in enumerate(names):
+        path = all_paths[name]
+        r, c = positions[idx]
+        fig.add_trace(go.Heatmap(
+            z=farm_prob, colorscale="Reds", showscale=False
+        ), row=r, col=c)
+        if path:
+            xs = [p[1] + 0.5 for p in path]
+            ys = [p[0] + 0.5 for p in path]
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode="lines",
+                line=dict(
+                    color=ALGO_COLORS.get(name, "cyan"),
+                    width=3 if name == best_algo else 1.5
+                ),
+                showlegend=False
+            ), row=r, col=c)
+            fig.add_trace(go.Scatter(
+                x=[xs[0]], y=[ys[0]], mode="markers",
+                marker=dict(size=9, color="yellow", symbol="star"),
+                showlegend=False
+            ), row=r, col=c)
+    fig.update_layout(
+        height=580, showlegend=False,
+        title=dict(text="All 5 Algorithm Paths — Best is Highlighted 🏆", font=dict(size=14)),
+        margin=dict(l=0, r=0, t=55, b=0)
+    )
+    return fig
+
+
+def fig_efficiency_bar(df_algo, best_algo):
+    df = df_algo.sort_values("Efficiency", ascending=True)
+    colors = [
+        "#16a34a" if a == best_algo else ALGO_COLORS.get(a, "#94a3b8")
+        for a in df["Algorithm"]
     ]
-    fig = go.Figure(data=go.Heatmap(
-        z=z, text=text,
-        texttemplate="%{text}",
-        colorscale=DISCRETE_SCALE,
-        showscale=False,
-        zmin=0, zmax=2
+    fig = go.Figure(go.Bar(
+        x=df["Efficiency"], y=df["Algorithm"], orientation="h",
+        marker_color=colors,
+        text=[f"{v:.4f}" for v in df["Efficiency"]], textposition="outside"
     ))
     fig.update_layout(
-        title="Predicted Stress per Plot",
-        height=300,
-        margin=dict(l=0, r=0, t=40, b=0)
+        title="Efficiency Score per Algorithm (Disease Gain ÷ Distance)",
+        xaxis_title="Efficiency", height=280,
+        margin=dict(l=0, r=60, t=40, b=0)
     )
     return fig
 
 
-# ══════════════════════════════════════════════
-# MAIN STREAMLIT APP
-# ══════════════════════════════════════════════
-def main():
-    st.set_page_config(page_title="AgroScan", layout="wide", page_icon="🌾")
+def fig_disease_pie(plot_disease_id):
+    counts = {DISEASE_LABELS[k]: int(np.sum(plot_disease_id == k)) for k in DISEASE_LABELS}
+    fig = go.Figure(go.Pie(
+        labels=list(counts.keys()),
+        values=list(counts.values()),
+        marker_colors=[DISEASE_COLORS[k] for k in counts],
+        hole=0.45, textinfo="label+percent+value"
+    ))
+    fig.update_layout(
+        title="Disease Distribution Across Farm",
+        height=300, margin=dict(l=0, r=0, t=40, b=0),
+        legend=dict(orientation="h", y=-0.15)
+    )
+    return fig
 
-    # ── Header ───────────────────────────────
+
+def fig_confidence_bar(plot_confidence, plot_disease_id):
+    labels, means, stds, colors = [], [], [], []
+    for did, label in DISEASE_LABELS.items():
+        mask = plot_disease_id == did
+        vals = plot_confidence[mask] * 100 if mask.any() else np.array([0.0])
+        labels.append(f"{DISEASE_ICONS[label]} {label}")
+        means.append(float(np.mean(vals)))
+        stds.append(float(np.std(vals)))
+        colors.append(DISEASE_COLORS[label])
+    fig = go.Figure(go.Bar(
+        x=labels, y=means,
+        error_y=dict(type="data", array=stds, visible=True),
+        marker_color=colors,
+        text=[f"{m:.1f}%" for m in means], textposition="outside"
+    ))
+    fig.update_layout(
+        title="Mean Model Confidence per Disease Class",
+        yaxis_title="Confidence (%)", yaxis_range=[0, 110],
+        height=280, margin=dict(l=0, r=0, t=40, b=0)
+    )
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════
+# CSS + CARD HELPERS
+# ══════════════════════════════════════════════════════════════════
+def inject_css():
     st.markdown("""
-        <h1 style='font-family:Georgia,serif; color:#166534;'>
-            🌾 AgroScan Farm Dashboard
-        </h1>
-        <p style='color:#6b7280; margin-top:-10px;'>
-            Precision Agriculture · Disease Localization · Optimized Treatment
-        </p>
-        <hr style='border-color:#d1fae5;'>
+    <style>
+    .stApp { background-color: #f0fdf4; }
+
+    .kpi-card {
+        background: white; border-radius: 12px;
+        padding: 0.9rem 1rem; text-align: center;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+        border-top: 4px solid #16a34a;
+    }
+    .kpi-label {
+        font-size: 0.68rem; color: #6b7280; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.07em;
+    }
+    .kpi-value { font-size: 1.7rem; font-weight: 800; color: #14532d; line-height: 1.15; }
+    .kpi-sub   { font-size: 0.68rem; color: #9ca3af; }
+
+    .section-hdr {
+        font-size: 0.95rem; font-weight: 700; color: #14532d;
+        border-left: 4px solid #16a34a; padding-left: 0.6rem;
+        margin: 1.1rem 0 0.5rem;
+    }
+
+    .algo-card {
+        background: white; border-radius: 10px;
+        padding: 0.7rem; text-align: center;
+        box-shadow: 0 1px 5px rgba(0,0,0,0.06);
+    }
+
+    .disease-pill {
+        display: inline-block; border-radius: 20px;
+        padding: 2px 10px; font-size: 0.75rem; font-weight: 600;
+        margin: 2px;
+    }
+
+    section[data-testid="stSidebar"] > div:first-child {
+        background: linear-gradient(180deg, #14532d 0%, #166534 100%);
+    }
+
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] label span,
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] .stSlider p,
+    section[data-testid="stSidebar"] .stNumberInput label,
+    section[data-testid="stSidebar"] .stCheckbox label,
+    section[data-testid="stSidebar"] .stCheckbox span {
+        color: white !important;
+    }
+    </style>
     """, unsafe_allow_html=True)
 
-    # ── Sidebar ───────────────────────────────
+
+def kpi_card(label, value, sub=""):
+    return (
+        f"<div class='kpi-card'>"
+        f"<div class='kpi-label'>{label}</div>"
+        f"<div class='kpi-value'>{value}</div>"
+        f"<div class='kpi-sub'>{sub}</div>"
+        f"</div>"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
+def main():
+    st.set_page_config(
+        page_title="AgroScan", layout="wide",
+        page_icon="🌾", initial_sidebar_state="expanded"
+    )
+    inject_css()
+
+    # ── Header ─────────────────────────────────────────────────────
+    st.markdown("""
+        <div style="background:linear-gradient(135deg,#14532d,#15803d);
+                    padding:1.4rem 2rem;border-radius:14px;margin-bottom:1.4rem;
+                    box-shadow:0 4px 16px rgba(0,0,0,0.14);">
+            <h1 style="color:white;margin:0;font-family:Georgia,serif;font-size:1.9rem;">
+                🌾 AgroScan
+            </h1>
+            <p style="color:#bbf7d0;margin:3px 0 0;font-size:0.9rem;">
+                Precision Agriculture · Disease Localisation · Optimised Drone Treatment
+            </p>
+            <div style="margin-top:0.55rem;font-size:0.78rem;">
+                <span style="background:#166534;color:#bbf7d0;border-radius:20px;
+                             padding:2px 10px;margin-right:6px;">
+                    📍 Thanjavur, Tamil Nadu</span>
+                <span style="background:#166534;color:#bbf7d0;border-radius:20px;
+                             padding:2px 10px;margin-right:6px;">
+                    4 × 4 Farm Grid · 256 × 256 px</span>
+                <span style="background:#166534;color:#bbf7d0;border-radius:20px;
+                             padding:2px 10px;">
+                    ConvLSTM2D Dual-Head Model</span>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # ── Sidebar ─────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("⚙️ Controls")
-        seed       = st.number_input("Random seed", min_value=0, value=42, step=1)
-        spray_pct  = st.slider("Spray zone percentile", 80, 98, 90)
+        st.markdown("<h3 style='color:white;margin-top:0;'>⚙️ Controls</h3>",
+                    unsafe_allow_html=True)
+        seed      = st.number_input("🎲 Random Seed", min_value=0, value=42, step=1)
+        spray_pct = st.slider(
+            "💧 Spray Percentile", 80, 98, 90,
+            help="Pixels above this severity percentile are marked as spray zones."
+        )
         show_spray = st.checkbox("Highlight spray zones", True)
         show_sim   = st.checkbox("Show simulated disease", True)
-        run        = st.button("▶ Run / Refresh Farm", use_container_width=True)
-
         st.markdown("---")
-        st.caption("Disease key")
+        run = st.button("▶ Run Farm Analysis", use_container_width=True, type="primary")
+        st.markdown("---")
+        st.markdown("<p style='color:#86efac;font-size:0.78rem;font-weight:600;'>Disease Key</p>",
+                    unsafe_allow_html=True)
         for label, color in DISEASE_COLORS.items():
             st.markdown(
-                f"<span style='color:{color}; font-size:18px;'>■</span> {label}",
+                f"<span style='color:{color};font-size:15px;'>■</span> "
+                f"<span style='color:white;font-size:0.82rem;'>"
+                f"{DISEASE_ICONS[label]} {label}</span>",
                 unsafe_allow_html=True
             )
-
         st.markdown("---")
-        # st.caption("📍 GPS Region: Thanjavur, Tamil Nadu")
-        # st.markdown(f"""
-        #     <small>
-        #     Lat: {LAT_MIN} → {LAT_MAX}<br>
-        #     Lon: {LON_MIN} → {LON_MAX}
-        #     </small>
-        # """, unsafe_allow_html=True)
+        st.markdown(
+            "<p style='color:#6ee7b7;font-size:0.72rem;line-height:1.7;'>"
+            "📡 <b style='color:white;'>GPS Region</b><br>"
+            "Lat: 10.7500 – 10.7564<br>"
+            "Lon: 79.1300 – 79.1364</p>",
+            unsafe_allow_html=True
+        )
 
-    # ── Session state ─────────────────────────
+    # ── Session state ───────────────────────────────────────────────
     if "result" not in st.session_state:
         st.session_state.result = None
 
     if run:
-        with st.spinner("Running farm analysis (this may take ~60 s)…"):
+        with st.spinner("🌾 Running farm analysis — this may take ~60 s…"):
             model  = _cached_model()
             result = run_farm_analysis(model, spray_pct, seed)
             st.session_state.result = result
-        st.success("Analysis complete!")
+        st.success("✅ Analysis complete! Explore the tabs below.")
 
     result = st.session_state.result
+
+    # ── Welcome screen ──────────────────────────────────────────────
     if result is None:
-        st.info("👈 Press **Run / Refresh Farm** in the sidebar to start.")
+        st.markdown("""
+        <div style="background:white;border-radius:14px;padding:2.5rem 2rem;
+                    box-shadow:0 2px 12px rgba(0,0,0,0.06);margin-top:1rem;text-align:center;">
+            <h2 style="color:#14532d;margin-top:0;">How AgroScan Works</h2>
+            <p style="color:#6b7280;">
+                Press <b>Run Farm Analysis</b> in the sidebar to start.</p>
+            <div style="display:flex;justify-content:center;gap:2.5rem;
+                        margin-top:1.5rem;flex-wrap:wrap;">
+                <div style="max-width:130px;">
+                    <div style="font-size:2.8rem;">🛰️</div>
+                    <b style="color:#14532d;font-size:0.9rem;">1. Simulate</b>
+                    <p style="font-size:0.78rem;color:#6b7280;margin-top:4px;">
+                        9-band Sentinel-2 data for 4×4 plots (T=12 timesteps)</p>
+                </div>
+                <div style="max-width:130px;">
+                    <div style="font-size:2.8rem;">🤖</div>
+                    <b style="color:#14532d;font-size:0.9rem;">2. Detect</b>
+                    <p style="font-size:0.78rem;color:#6b7280;margin-top:4px;">
+                        ConvLSTM2D classifies disease + generates probability mask</p>
+                </div>
+                <div style="max-width:130px;">
+                    <div style="font-size:2.8rem;">🗺️</div>
+                    <b style="color:#14532d;font-size:0.9rem;">3. Map</b>
+                    <p style="font-size:0.78rem;color:#6b7280;margin-top:4px;">
+                        Stitch 16 predictions → 256×256 farm disease heatmap</p>
+                </div>
+                <div style="max-width:130px;">
+                    <div style="font-size:2.8rem;">🚁</div>
+                    <b style="color:#14532d;font-size:0.9rem;">4. Route</b>
+                    <p style="font-size:0.78rem;color:#6b7280;margin-top:4px;">
+                        5 algorithms compete — best route drives autonomous treatment</p>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         st.stop()
 
+    # ── Unpack ──────────────────────────────────────────────────────
     farm_prob    = result["farm_prob"]
     farm_spray   = result["farm_spray"]
     path         = result["path"]
     best_algo    = result["best_algo"]
     df_waypoints = result["df_waypoints"]
-    gy, gx       = result["grid_y"], result["grid_x"]
+    df_algo      = result["df_algo"]
+    all_paths    = result["all_paths"]
     pid          = result["plot_disease_id"]
     conf         = result["plot_confidence"]
     sim          = result["plot_simulated"]
 
-    # ── KPI row ───────────────────────────────
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Plots",     gy * gx)
-    k2.metric("Spray Coverage",  f"{100 * farm_spray.mean():.1f}%")
-    k3.metric("Treatment Steps", len(path))
-    k4.metric("Best Algorithm",  best_algo)
-    k5.metric("Spray Waypoints", len(df_waypoints))
+    # ── KPI Row ─────────────────────────────────────────────────────
+    kpi_data = [
+        ("Total Plots",     f"{GRID_Y * GRID_X}",             "4 × 4 grid"),
+        ("Spray Coverage",  f"{100*farm_spray.mean():.1f}%",  f"≥ {spray_pct}th %ile"),
+        ("Treatment Steps", f"{len(path):,}",                  "pixel waypoints"),
+        ("Best Algorithm",  best_algo,                         "by efficiency"),
+        ("Spray Waypoints", f"{len(df_waypoints)}",            "GPS-tagged"),
+        ("Avg Confidence",  f"{100*conf.mean():.1f}%",         "model certainty"),
+    ]
+    for col, (label, value, sub) in zip(st.columns(6), kpi_data):
+        col.markdown(kpi_card(label, value, sub), unsafe_allow_html=True)
 
-    st.markdown("---")
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Main charts ───────────────────────────
-    col_map, col_grid = st.columns([3, 1])
+    # ── Tabs ────────────────────────────────────────────────────────
+    t1, t2, t3, t4, t5 = st.tabs([
+        "🌾 Farm Overview",
+        "🗺️  GPS Map",
+        "📊 Analytics",
+        "🤖 Algorithm Comparison",
+        "📋 Reports",
+    ])
 
-    with col_map:
+    # ═══ Tab 1 — Farm Overview ══════════════════════════════════════
+    with t1:
+        col_map, col_side = st.columns([3, 1])
+        with col_map:
+            st.plotly_chart(
+                fig_farm_map(farm_prob, farm_spray, path, show_spray),
+                use_container_width=True
+            )
+        with col_side:
+            st.plotly_chart(fig_stress_grid(pid), use_container_width=True)
+            st.markdown("<div class='section-hdr'>Plot Summary</div>",
+                        unsafe_allow_html=True)
+            counts = {DISEASE_LABELS[k]: int(np.sum(pid == k)) for k in DISEASE_LABELS}
+            for name, count in counts.items():
+                color = DISEASE_COLORS[name]
+                icon  = DISEASE_ICONS[name]
+                st.markdown(
+                    f"<div style='background:white;border-radius:8px;padding:5px 10px;"
+                    f"margin:3px 0;border-left:3px solid {color};font-size:0.82rem;'>"
+                    f"{icon} <b>{name}</b><br>"
+                    f"<span style='color:#6b7280;'>{count} plot(s) · "
+                    f"{100*count/(GRID_Y*GRID_X):.0f}%</span>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+    # ═══ Tab 2 — GPS Map ════════════════════════════════════════════
+    with t2:
+        st.markdown(
+            "<div class='section-hdr'>📍 Real-world GPS Map — Thanjavur, Tamil Nadu</div>",
+            unsafe_allow_html=True
+        )
+        st.caption(
+            "Disease zone centres, spray waypoints, and treatment route plotted on "
+            "OpenStreetMap satellite coordinates. Route sampled every 4 pixels for performance."
+        )
+        st.plotly_chart(fig_gps_map(df_waypoints, path, pid), use_container_width=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Spray Waypoints on Map", len(df_waypoints))
+        c2.metric("Route Sampling", "Every 4 pixels")
+        c3.metric("Coordinate System", "WGS-84")
+
+    # ═══ Tab 3 — Analytics ══════════════════════════════════════════
+    with t3:
+        st.markdown("<div class='section-hdr'>Disease Distribution & Model Confidence</div>",
+                    unsafe_allow_html=True)
+        ca, cb = st.columns(2)
+        with ca:
+            st.plotly_chart(fig_disease_pie(pid), use_container_width=True)
+        with cb:
+            st.plotly_chart(fig_confidence_bar(conf, pid), use_container_width=True)
+
+        st.markdown("<div class='section-hdr'>Algorithm Efficiency Ranking</div>",
+                    unsafe_allow_html=True)
+        st.plotly_chart(fig_efficiency_bar(df_algo, best_algo), use_container_width=True)
+
+    # ═══ Tab 4 — Algorithm Comparison ═══════════════════════════════
+    with t4:
+        st.markdown("<div class='section-hdr'>All 5 Paths — Side by Side</div>",
+                    unsafe_allow_html=True)
         st.plotly_chart(
-            fig_route_map(farm_prob, farm_spray, path, show_spray),
+            fig_algo_paths(farm_prob, all_paths, best_algo),
             use_container_width=True
         )
+        st.markdown("<div class='section-hdr'>Per-Algorithm Metrics</div>",
+                    unsafe_allow_html=True)
+        cols5 = st.columns(5)
+        for col, (_, row) in zip(cols5, df_algo.iterrows()):
+            name  = row["Algorithm"]
+            color = "#16a34a" if name == best_algo else ALGO_COLORS.get(name, "#94a3b8")
+            badge = "🏆 Best" if name == best_algo else ""
+            col.markdown(
+                f"<div class='algo-card' style='border-top:3px solid {color};'>"
+                f"<div style='font-size:0.68rem;font-weight:700;color:#6b7280;'>{name}</div>"
+                f"<div style='font-size:1.4rem;font-weight:800;color:{color};'>"
+                f"{row['Efficiency']:.4f}</div>"
+                f"<div style='font-size:0.68rem;color:#9ca3af;'>efficiency</div>"
+                f"<div style='font-size:0.78rem;color:#374151;margin-top:5px;'>"
+                f"📏 {row['Distance']:.0f} px<br>"
+                f"↩️ {row['Turns']} turns<br>"
+                f"⏱ {row['Runtime (s)']:.3f} s</div>"
+                f"<div style='font-size:0.8rem;margin-top:4px;'>{badge}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.dataframe(df_algo, use_container_width=True, hide_index=True)
 
-    with col_grid:
-        st.plotly_chart(
-            fig_stress_grid(pid, gy, gx),
-            use_container_width=True
+    # ═══ Tab 5 — Reports ════════════════════════════════════════════
+    with t5:
+        st.markdown("<div class='section-hdr'>📍 Spray Waypoints — GPS Coordinates</div>",
+                    unsafe_allow_html=True)
+        st.caption(
+            f"{len(df_waypoints)} spray-zone waypoints · "
+            "Download as CSV for drone / robot autonomous navigation."
+        )
+        st.dataframe(df_waypoints, use_container_width=True)
+        st.download_button(
+            "⬇️ Download Spray Waypoints CSV",
+            data=df_waypoints.to_csv(index=False).encode("utf-8"),
+            file_name=f"agroscan_spray_waypoints_seed{seed}.csv",
+            mime="text/csv"
         )
 
-    st.markdown("---")
-
-    # ── Spray Waypoints + CSV Download ───────
-    st.subheader("📍 Spray Waypoints – GPS Coordinates")
-    st.caption(
-        f"Showing {len(df_waypoints)} spray-zone waypoints only. "
-        "Download as CSV for drone / robot autonomous navigation."
-    )
-
-    st.dataframe(df_waypoints, use_container_width=True)
-
-    csv_bytes = df_waypoints.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="⬇️ Download Spray Waypoints CSV",
-        data=csv_bytes,
-        file_name=f"agroscan_spray_waypoints_seed{seed}.csv",
-        mime="text/csv",
-        help="GPS coordinates of spray zones for drone/robot navigation"
-    )
-
-    st.markdown("---")
-
-    # ── Per-plot table ────────────────────────
-    st.subheader("📋 Plot-by-Plot Report")
-
-    rows = []
-    for r in range(gy):
-        for c in range(gx):
-            centre_row = r * PLOT_H + PLOT_H // 2
-            centre_col = c * PLOT_W + PLOT_W // 2
-            lat, lon   = pixel_to_gps(centre_row, centre_col)
-
-            row = {
-                "Row":              r,
-                "Col":              c,
-                "Predicted Stress": DISEASE_LABELS[pid[r, c]],
-                "Confidence %":     round(float(conf[r, c]) * 100, 1),
-                "Centre Lat":       lat,
-                "Centre Lon":       lon,
-            }
-            if show_sim:
-                row["Simulated Disease"] = str(sim[r, c])
-                row["Match ✓/✗"] = (
-                    "✓" if (
+        st.markdown("---")
+        st.markdown("<div class='section-hdr'>📋 Plot-by-Plot Report</div>",
+                    unsafe_allow_html=True)
+        rows = []
+        for r in range(GRID_Y):
+            for c in range(GRID_X):
+                cr, cc   = r * PLOT_H + PLOT_H // 2, c * PLOT_W + PLOT_W // 2
+                lat, lon = pixel_to_gps(cr, cc)
+                rd = {
+                    "Plot":             f"({r},{c})",
+                    "Predicted Stress": DISEASE_LABELS[pid[r, c]],
+                    "Confidence %":     round(float(conf[r, c]) * 100, 1),
+                    "Centre Lat":       lat,
+                    "Centre Lon":       lon,
+                }
+                if show_sim:
+                    rd["Simulated"]  = str(sim[r, c])
+                    rd["Match ✓/✗"] = "✓" if (
                         (sim[r, c] == "pest"         and pid[r, c] == 0) or
                         (sim[r, c] == "overwater"    and pid[r, c] == 1) or
                         (sim[r, c] == "water_stress" and pid[r, c] == 2)
                     ) else "✗"
-                )
-            rows.append(row)
+                rows.append(rd)
+        st.dataframe(rows, use_container_width=True)
 
-    st.dataframe(rows, use_container_width=True)
-
-    # ── Disease count summary ─────────────────
-    st.subheader("📊 Disease Distribution")
-    counts = {DISEASE_LABELS[k]: int(np.sum(pid == k)) for k in DISEASE_LABELS}
-    col_a, col_b, col_c = st.columns(3)
-    for col, (name, count) in zip([col_a, col_b, col_c], counts.items()):
-        col.metric(name, count, f"{100 * count / (gy * gx):.0f}% of plots")
+        st.markdown("---")
+        st.markdown("<div class='section-hdr'>📊 Disease Distribution Summary</div>",
+                    unsafe_allow_html=True)
+        counts = {DISEASE_LABELS[k]: int(np.sum(pid == k)) for k in DISEASE_LABELS}
+        for col, (name, count) in zip(st.columns(3), counts.items()):
+            col.metric(
+                f"{DISEASE_ICONS[name]} {name}",
+                count,
+                f"{100*count/(GRID_Y*GRID_X):.0f}% of plots"
+            )
 
 
 if __name__ == "__main__":
